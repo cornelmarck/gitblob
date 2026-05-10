@@ -2,5 +2,8 @@
 zig-out
 zig-pkg
 
+.claude
+
 testing/.venv
 testing/__pycache__
+repos
