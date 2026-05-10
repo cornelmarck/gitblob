@@ -186,49 +186,140 @@ fn writeRefAdvertisement(repo: *git.Repository, service: Service, w: *std.Io.Wri
 const RefCommand = struct {
     old_oid: git.Oid,
     new_oid: git.Oid,
-    /// Slice into the request body — must not outlive the request.
+    /// Owned by the request arena (the streaming pkt buffer is reused).
     refname: []const u8,
 };
+
+/// Per-read socket timeout for streaming the request body. Bigger than a
+/// typical TCP RTT but small enough to bound a stuck client.
+const body_read_timeout_ms: usize = 30_000;
+
+/// Chunk size for pumping pack bytes into the indexer. Big enough to amortise
+/// syscall overhead, small enough to keep peak RSS bounded regardless of
+/// pack size.
+const pack_chunk_size: usize = 64 * 1024;
 
 pub fn receivePack(app: *App, url_repo: []const u8, req: *httpz.Request, res: *httpz.Response) !void {
     var handle = openOrCreateOrRespond(app, res, url_repo) orelse return;
     defer handle.deinit();
     std.log.info("git-receive-pack repo={s}", .{handle.name});
 
-    const body = req.body() orelse return badRequest(res, "missing body");
-
-    const parsed = parseReceivePackBody(res.arena, body) catch |err| {
-        std.log.warn("receive-pack parse error: {s}", .{@errorName(err)});
-        return badRequest(res, "malformed receive-pack request");
+    var body_reader = req.reader(body_read_timeout_ms) catch {
+        return badRequest(res, "missing body");
     };
+    var pkt_buf: [pkt.min_buffer_capacity]u8 = undefined;
+    var io = pkt.IoReader(@TypeOf(body_reader)).init(&body_reader, &pkt_buf);
+    const r = &io.interface;
 
-    std.log.info("receive-pack: body={d}B commands={d} pack={d}B", .{ body.len, parsed.commands.len, parsed.pack.len });
+    var commands = std.ArrayList(RefCommand).empty;
+    defer commands.deinit(res.arena);
+
+    // 1. Read ref-update commands (one pkt-line each) up to the flush packet.
+    while (true) {
+        const line = (pkt.nextLine(r) catch |err| {
+            std.log.warn("receive-pack parse error: {s}", .{@errorName(err)});
+            return badRequest(res, "malformed receive-pack request");
+        }) orelse return badRequest(res, "missing body");
+
+        switch (line.kind) {
+            .flush => break,
+            .delim => continue,
+            .data => {
+                // `<old-oid> SP <new-oid> SP <refname>[\0<caps>][\n]`
+                var payload = line.payload;
+                if (payload.len > 0 and payload[payload.len - 1] == '\n') {
+                    payload = payload[0 .. payload.len - 1];
+                }
+                if (std.mem.indexOfScalar(u8, payload, 0)) |nul| {
+                    payload = payload[0..nul];
+                }
+                if (payload.len < git.oid_hex_len * 2 + 3)
+                    return badRequest(res, "malformed receive-pack request");
+                const old_hex = payload[0..git.oid_hex_len];
+                if (payload[git.oid_hex_len] != ' ')
+                    return badRequest(res, "malformed receive-pack request");
+                const new_hex = payload[git.oid_hex_len + 1 .. git.oid_hex_len * 2 + 1];
+                if (payload[git.oid_hex_len * 2 + 1] != ' ')
+                    return badRequest(res, "malformed receive-pack request");
+                const refname_src = payload[git.oid_hex_len * 2 + 2 ..];
+
+                // The pkt buffer is reused on the next read, so the refname
+                // must outlive it. Copy into the request arena.
+                const refname = try res.arena.dupe(u8, refname_src);
+
+                try commands.append(res.arena, .{
+                    .old_oid = try git.Oid.fromHex(old_hex),
+                    .new_oid = try git.Oid.fromHex(new_hex),
+                    .refname = refname,
+                });
+            },
+        }
+    }
 
     const has_writes = blk: {
-        for (parsed.commands) |cmd| if (!cmd.new_oid.isZero()) break :blk true;
+        for (commands.items) |cmd| if (!cmd.new_oid.isZero()) break :blk true;
         break :blk false;
     };
 
-    var aw = std.Io.Writer.Allocating.init(res.arena);
-    const w = &aw.writer;
-
-    // 1. Ingest the packfile (if any) into the repo's odb.
+    // 2. Ingest the packfile (if any) by streaming the rest of the body
+    //    directly into libgit2's indexer. No buffering of the full pack.
     var unpack_ok = true;
     var unpack_err_msg: []const u8 = "";
+    var pack_bytes: usize = 0;
+
     if (has_writes) {
-        if (parsed.pack.len == 0) {
+        // libgit2's indexer writes pack-XXXXX.{pack,idx} into the directory
+        // we pass. For the ODB to see them on the next lookup, that directory
+        // must be `<repo>/objects/pack/`. libgit2 creates it on first append.
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const pack_dir = try std.fmt.bufPrintZ(&path_buf, "{s}/objects/pack", .{handle.fs_path});
+
+        var indexer = try git.Indexer.init(pack_dir);
+        defer indexer.deinit();
+
+        var chunk: [pack_chunk_size]u8 = undefined;
+        while (true) {
+            const n = r.readSliceShort(&chunk) catch |err| {
+                unpack_ok = false;
+                unpack_err_msg = @errorName(err);
+                break;
+            };
+            if (n == 0) break;
+            pack_bytes += n;
+            indexer.append(chunk[0..n]) catch |err| {
+                unpack_ok = false;
+                unpack_err_msg = @errorName(err);
+                break;
+            };
+            if (n < chunk.len) break;
+        }
+
+        if (unpack_ok and pack_bytes == 0) {
             unpack_ok = false;
             unpack_err_msg = "no pack data";
-        } else {
-            indexPack(&handle, parsed.pack) catch |err| {
+        }
+        if (unpack_ok) {
+            indexer.commit() catch |err| {
+                unpack_ok = false;
+                unpack_err_msg = @errorName(err);
+            };
+        }
+        if (unpack_ok) {
+            // Make freshly-written objects visible to the ref-update step.
+            handle.repo.refreshOdb() catch |err| {
                 unpack_ok = false;
                 unpack_err_msg = @errorName(err);
             };
         }
     }
 
-    // 2. Apply ref updates and report status. Even on unpack failure we
-    //    still send report-status so the client can render an error.
+    std.log.info("receive-pack: commands={d} pack={d}B", .{ commands.items.len, pack_bytes });
+
+    // 3. Apply ref updates and report status. Even on unpack failure we still
+    //    send report-status so the client can render an error.
+    var aw = std.Io.Writer.Allocating.init(res.arena);
+    const w = &aw.writer;
+
     if (unpack_ok) {
         try pkt.writeLineLn(w, "unpack ok");
     } else {
@@ -237,7 +328,7 @@ pub fn receivePack(app: *App, url_repo: []const u8, req: *httpz.Request, res: *h
         try pkt.writeLineLn(w, line);
     }
 
-    for (parsed.commands) |cmd| {
+    for (commands.items) |cmd| {
         const result = if (!unpack_ok)
             CmdResult{ .ng = "unpacker error" }
         else
@@ -255,79 +346,6 @@ pub fn receivePack(app: *App, url_repo: []const u8, req: *httpz.Request, res: *h
     res.status = 200;
     res.headers.add("content-type", "application/x-git-receive-pack-result");
     res.body = aw.written();
-}
-
-const ParsedReceivePack = struct {
-    commands: []const RefCommand,
-    /// Pack bytes (PACK header + objects + trailer). Empty if all commands
-    /// are deletes.
-    pack: []const u8,
-    /// Capabilities the client requested (informational only — we just log).
-    caps: []const u8,
-};
-
-fn parseReceivePackBody(arena: std.mem.Allocator, body: []const u8) !ParsedReceivePack {
-    var commands = std.ArrayList(RefCommand).empty;
-    defer commands.deinit(arena);
-
-    var caps: []const u8 = "";
-
-    var it = pkt.Iterator.init(body);
-    while (try it.next()) |line| {
-        switch (line.kind) {
-            .flush => break,
-            .delim => continue,
-            .data => {
-                // `<old-oid> SP <new-oid> SP <refname>[\0<caps>][\n]`
-                var payload = line.payload;
-                if (payload.len > 0 and payload[payload.len - 1] == '\n') {
-                    payload = payload[0 .. payload.len - 1];
-                }
-                if (std.mem.indexOfScalar(u8, payload, 0)) |nul| {
-                    if (caps.len == 0) caps = payload[nul + 1 ..];
-                    payload = payload[0..nul];
-                }
-                if (payload.len < git.oid_hex_len * 2 + 3) return error.MalformedCommand;
-                const old_hex = payload[0..git.oid_hex_len];
-                if (payload[git.oid_hex_len] != ' ') return error.MalformedCommand;
-                const new_hex = payload[git.oid_hex_len + 1 .. git.oid_hex_len * 2 + 1];
-                if (payload[git.oid_hex_len * 2 + 1] != ' ') return error.MalformedCommand;
-                const refname = payload[git.oid_hex_len * 2 + 2 ..];
-
-                try commands.append(arena, .{
-                    .old_oid = try git.Oid.fromHex(old_hex),
-                    .new_oid = try git.Oid.fromHex(new_hex),
-                    .refname = refname,
-                });
-            },
-        }
-    }
-
-    const pack = it.rest;
-    return .{
-        .commands = try commands.toOwnedSlice(arena),
-        .pack = pack,
-        .caps = caps,
-    };
-}
-
-fn indexPack(handle: *@import("../repo/store.zig").Handle, pack: []const u8) !void {
-    // The indexer writes pack-XXXXX.{pack,idx} into the directory we pass.
-    // For the ODB to find the new pack on the next lookup, it must land in
-    // `<repo>/objects/pack/`. libgit2's repo init creates objects/ but not
-    // the pack/ subdir — the indexer creates it on first append for us...
-    // (verified empirically; if missing libgit2 returns an error which we
-    // surface as `unpack libgit2 error`).
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const pack_dir = try std.fmt.bufPrintZ(&path_buf, "{s}/objects/pack", .{handle.fs_path});
-
-    var indexer = try git.Indexer.init(pack_dir);
-    defer indexer.deinit();
-    try indexer.append(pack);
-    try indexer.commit();
-
-    // Make freshly-written objects visible to subsequent ref creations.
-    try handle.repo.refreshOdb();
 }
 
 const CmdResult = union(enum) {
@@ -378,14 +396,45 @@ pub fn uploadPack(app: *App, url_repo: []const u8, req: *httpz.Request, res: *ht
     defer handle.deinit();
     std.log.info("git-upload-pack repo={s}", .{handle.name});
 
-    const body = req.body() orelse return badRequest(res, "missing body");
-
-    const parsed = parseUploadPackBody(res.arena, body) catch |err| {
-        std.log.warn("upload-pack parse error: {s}", .{@errorName(err)});
-        return badRequest(res, "malformed upload-pack request");
+    var body_reader = req.reader(body_read_timeout_ms) catch {
+        return badRequest(res, "missing body");
     };
+    var pkt_buf: [pkt.min_buffer_capacity]u8 = undefined;
+    var io = pkt.IoReader(@TypeOf(body_reader)).init(&body_reader, &pkt_buf);
+    const r = &io.interface;
 
-    if (parsed.wants.len == 0) return badRequest(res, "no want lines");
+    var wants = std.ArrayList(git.Oid).empty;
+    defer wants.deinit(res.arena);
+
+    // Read pkt-lines up to the first flush. Anything past it (haves, done)
+    // is ignored; without multi_ack advertised the response is just NAK + pack
+    // and httpz drains the rest of the body for us before keepalive.
+    while (true) {
+        const line = (pkt.nextLine(r) catch |err| {
+            std.log.warn("upload-pack parse error: {s}", .{@errorName(err)});
+            return badRequest(res, "malformed upload-pack request");
+        }) orelse break;
+
+        switch (line.kind) {
+            .flush => break,
+            .delim => continue,
+            .data => {
+                var payload = line.payload;
+                if (payload.len > 0 and payload[payload.len - 1] == '\n') {
+                    payload = payload[0 .. payload.len - 1];
+                }
+
+                if (!std.mem.startsWith(u8, payload, "want ")) continue;
+                payload = payload["want ".len..];
+
+                if (payload.len < git.oid_hex_len) return badRequest(res, "malformed upload-pack request");
+                const oid = try git.Oid.fromHex(payload[0..git.oid_hex_len]);
+                try wants.append(res.arena, oid);
+            },
+        }
+    }
+
+    if (wants.items.len == 0) return badRequest(res, "no want lines");
 
     var aw = std.Io.Writer.Allocating.init(res.arena);
     const w = &aw.writer;
@@ -412,7 +461,7 @@ pub fn uploadPack(app: *App, url_repo: []const u8, req: *httpz.Request, res: *ht
     };
     defer walk.deinit();
 
-    for (parsed.wants) |oid| {
+    for (wants.items) |oid| {
         walk.push(oid) catch |err| {
             std.log.warn("revwalk push failed: {s}", .{@errorName(err)});
             res.status = 500;
@@ -457,53 +506,6 @@ pub fn uploadPack(app: *App, url_repo: []const u8, req: *httpz.Request, res: *ht
     res.status = 200;
     res.headers.add("content-type", "application/x-git-upload-pack-result");
     res.body = aw.written();
-}
-
-const ParsedUploadPack = struct {
-    wants: []const git.Oid,
-    caps: []const u8,
-};
-
-fn parseUploadPackBody(arena: std.mem.Allocator, body: []const u8) !ParsedUploadPack {
-    var wants = std.ArrayList(git.Oid).empty;
-    defer wants.deinit(arena);
-    var caps: []const u8 = "";
-
-    var it = pkt.Iterator.init(body);
-    while (try it.next()) |line| {
-        switch (line.kind) {
-            .flush => {
-                // After the first flush, what follows is haves + done. We
-                // ignore haves (no multi_ack) and don't need to parse done
-                // for a clone-style pack response.
-                break;
-            },
-            .delim => continue,
-            .data => {
-                var payload = line.payload;
-                if (payload.len > 0 and payload[payload.len - 1] == '\n') {
-                    payload = payload[0 .. payload.len - 1];
-                }
-
-                if (!std.mem.startsWith(u8, payload, "want ")) continue;
-                payload = payload["want ".len..];
-
-                if (payload.len < git.oid_hex_len) return error.MalformedWant;
-                const oid_hex = payload[0..git.oid_hex_len];
-                const oid = try git.Oid.fromHex(oid_hex);
-                try wants.append(arena, oid);
-
-                if (payload.len > git.oid_hex_len + 1 and caps.len == 0) {
-                    caps = payload[git.oid_hex_len + 1 ..];
-                }
-            },
-        }
-    }
-
-    return .{
-        .wants = try wants.toOwnedSlice(arena),
-        .caps = caps,
-    };
 }
 
 // ─── store helpers ──────────────────────────────────────────────────────────
