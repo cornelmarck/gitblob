@@ -29,8 +29,14 @@ FIXTURE_ENV = {
 
 def git(*args: str, cwd: Path) -> None:
     env = {**os.environ, **FIXTURE_ENV}
-    subprocess.run(["git", *args], cwd=cwd, env=env, check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
 
 
 def build(dest: Path) -> None:
@@ -39,7 +45,7 @@ def build(dest: Path) -> None:
     dest.mkdir(parents=True)
 
     git("init", "-q", "-b", "main", cwd=dest)
-    git("config", "user.name",  FIXTURE_ENV["GIT_AUTHOR_NAME"], cwd=dest)
+    git("config", "user.name", FIXTURE_ENV["GIT_AUTHOR_NAME"], cwd=dest)
     git("config", "user.email", FIXTURE_ENV["GIT_AUTHOR_EMAIL"], cwd=dest)
 
     (dest / "README").write_text("hello, gitblob\n")
