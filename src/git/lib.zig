@@ -242,6 +242,7 @@ pub const RefIterator = struct {
 
 pub const Indexer = struct {
     raw: *c.git_indexer,
+    odb: *c.git_odb,
     /// Single progress struct reused across append/commit. libgit2 reads
     /// `total_objects + local_objects` during commit to fix the pack
     /// header — passing two distinct uninitialized structs corrupts the
@@ -249,18 +250,25 @@ pub const Indexer = struct {
     /// the C code that yields `0x55555554` in the on-disk header).
     stats: c.git_indexer_progress,
 
-    pub fn init(repo_path: [:0]const u8) Error!Indexer {
+    pub fn init(repo: *const Repository, pack_dir: [:0]const u8) Error!Indexer {
+        var odb: ?*c.git_odb = null;
+        const orc = c.git_repository_odb(&odb, repo.raw);
+        if (orc < 0) return mapErr(orc);
+        errdefer c.git_odb_free(odb);
+
         var raw: ?*c.git_indexer = null;
-        const rc = c.git_indexer_new(&raw, repo_path.ptr, 0, null, null);
+        const rc = c.git_indexer_new(&raw, pack_dir.ptr, 0, odb, null);
         if (rc < 0) return mapErr(rc);
         return .{
             .raw = raw.?,
+            .odb = odb.?,
             .stats = std.mem.zeroes(c.git_indexer_progress),
         };
     }
 
     pub fn deinit(self: *Indexer) void {
         c.git_indexer_free(self.raw);
+        c.git_odb_free(self.odb);
     }
 
     pub fn append(self: *Indexer, data: []const u8) Error!void {

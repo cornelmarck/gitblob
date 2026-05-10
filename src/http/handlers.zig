@@ -274,7 +274,7 @@ pub fn receivePack(app: *App, url_repo: []const u8, req: *httpz.Request, res: *h
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const pack_dir = try std.fmt.bufPrintZ(&path_buf, "{s}/objects/pack", .{handle.fs_path});
 
-        var indexer = try git.Indexer.init(pack_dir);
+        var indexer = try git.Indexer.init(&handle.repo, pack_dir);
         defer indexer.deinit();
 
         var chunk: [pack_chunk_size]u8 = undefined;
