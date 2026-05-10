@@ -1,0 +1,6 @@
+.zig-cache
+zig-out
+zig-pkg
+
+testing/.venv
+testing/__pycache__
